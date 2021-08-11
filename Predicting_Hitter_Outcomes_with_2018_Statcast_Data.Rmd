@@ -1,0 +1,2212 @@
+---
+title: "Predicting Hitter Outcomes with 2018 Statcast Data"
+author: "Shamir Naran"
+output: pdf_document 
+---
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+library(kableExtra) # rmarkdown tables
+library(tidyverse) # loads readr, dplyr, ggplot2 and other useful packages
+library(ggpubr) # ggarrange function
+library(corrplot) # correlation plot
+library(RColorBrewer) # correlation plot
+library(gridExtra) # grid.arrange
+library(leaps) # regsubsets()
+library(factoextra) # clustering
+library(e1071) # tune.randomForest and naiveBayes
+library(randomForest) # for random forest
+library(rpart) # for decision trees
+library(adabag) # for adaptive boosting
+library(caret) # for adaptive boosting
+library(nnet) # for neural networks
+```
+
+```{r warning=FALSE, echo=FALSE}
+# Read in 2018 Statcast data and MLBID
+
+sc_18 <- read.csv(file = "statcast_18.csv", header = TRUE)
+MLBID <- read.csv("MLBID.csv", header = TRUE)
+```
+
+```{r, echo=FALSE}
+# Prepare 2018 Data for Modeling and Analysis
+
+# Turn categorical variables into factors
+
+sc_18 <- sc_18 %>%
+        mutate_if(is.character, as.factor)
+sc_18 <- mutate(sc_18, fielding_team = ifelse(sc_18$inning_topbot == "Top",
+                                            as.character(sc_18$home_team), 
+                                            as.character(sc_18$away_team)))
+
+# Identify pitches in play
+temp <- sc_18 %>%
+          filter(type == "X")
+
+# Create new variables "hit_count", "fielding_team", "spray_angle", "ba_outcome", "slg_outcome"
+temp <- mutate(temp, hit_count = paste(temp$balls,"-",temp$strikes))
+temp <- mutate(temp, fielding_team = ifelse(temp$inning_topbot == "Top",
+                                            as.character(temp$home_team), 
+                                            as.character(temp$away_team)))
+temp <- mutate(temp, spray_angle = temp$hc_x)
+temp <- mutate(temp, ba_outcome = temp$events)
+temp <- mutate(temp, slg_outcome = temp$events)
+
+# Calculate "spray_angle", formula found in references
+
+temp$spray_angle <- atan((temp$hc_x-125.42)/(198.27-temp$hc_y))
+
+# Binary "ba_outcome" variable, hit or out
+temp$ba_outcome <- if_else(temp$ba_outcome == "single"|
+                           temp$ba_outcome == "double"|
+                           temp$ba_outcome == "triple"|
+                           temp$ba_outcome == "home_run",
+                           "hit","not_hit")
+
+# Identify "slg_outcome", singles, doubles, triples, and home runs
+temp$slg_outcome <- recode_factor(temp$slg_outcome,
+                             "batter_interference" = "not_hit",
+                              "caught_stealing_2b" = "not_hit",
+                              "caught_stealing_3b" = "not_hit",
+                              "caught_stealing_home" = "not_hit",
+                              "double_play" = "not_hit",
+                              "field_error" = "not_hit",
+                              "field_out" = "not_hit",
+                              "fielders_choice" = "not_hit",
+                              "fielders_choice_out" = "not_hit",
+                              "force_out" = "not_hit",
+                              "grounded_into_double_play" = "not_hit",
+                              "hit_by_pitch" = "not_hit",
+                              "interf_def" = "not_hit",
+                              "null" = "not_hit",
+                              "other_out" = "not_hit",
+                              "pickoff_1b" = "not_hit",
+                              "pickoff_2b" = "not_hit",
+                              "pickoff_3b" = "not_hit",
+                              "pickoff_caught_stealing_2b" = "not_hit",
+                              "pickoff_caught_stealing_3b" = "not_hit",
+                              "pickoff_caught_stealing_home" = "not_hit",
+                              "run" = "not_hit",
+                              "sac_bunt" = "not_hit",
+                              "sac_bunt_double_play" = "not_hit",
+                              "sac_fly" = "not_hit",
+                              "sac_fly_double_play" = "not_hit",
+                              "strikeout" = "not_hit",
+                              "strikeout_double_play" = "not_hit",
+                              "triple_play" = "not_hit",
+                              "walk" = "not_hit")
+
+# Change Outcome to factor variable
+temp <- temp %>% 
+  mutate_if(is.character, as.factor)
+
+# Keep variables for analysis
+# df is for binary response (hit or not hit)
+# df2 is for 5 response (single, double, triple, home run, or not hit)
+
+df <- select(temp, c(launch_angle, launch_speed, hit_distance_sc,
+                     hc_x, hc_y, spray_angle, stand, fielding_team, hit_count, ba_outcome))
+df <- df[-which(df$hit_count == "4 - 2"),] # remove the 4-2 count, not sure why it's there
+df <- na.omit(df)
+
+df2 <- select(temp, c(launch_angle, launch_speed, hit_distance_sc,
+                      hit_location, hc_x, hc_y, stand, hit_count, spray_angle, slg_outcome))
+df2 <- df2[-which(df2$hit_count == "4 - 2"),] # remove the 4-2 count, not sure why it's there
+df2 <- na.omit(df2)
+
+rm(temp) # remove temp from global environment
+```
+
+
+# Abstract
+
+It is well-known that data analysis in baseball front offices has skyrocketed over the last decade making it essential for the avid fan to keep up. This report aims to introduce some of the variables teams are researching and what questions we seek to answer with such data. Specifically, it investigates how predicting hitter outcomes through statistical methodology can be useful when evaluating players.
+
+Six classification methods were trained and tested to predict whether a pitch hit into play resulted in a hit or non-hit. The six methods were logistic regression, decision trees, random forests, adaptive boosting, naive Bayes, and neural networks. To go one step further, four of the six classification methods were compared to predict whether a pitch hit into play resulted in a single, double, triple, home run, or non-hit.
+
+Of the methods, random forests provides the best results with a respectable ninety percent accuracy rate. We conclude that variables such as launch angle, launch speed, and hit distance can help accurately predict hitter outcomes. Using statcast data with statistical concepts only encourages further baseball analysis. To name a few, one can dive deeper into topics such as pitch sequence, expected swing-and-miss, and catcher framing.
+
+\newpage
+
+# Introduction
+
+On August 5th 2018, with the Yankees visiting the Red Sox in Fenway Park, Giancarlo Stanton lined a 3-1 1st inning fastball from pitcher David Price into left field. On April 8th 2018, with the Braves visiting the Rockies in Colorado, DJ LeMahieu barely makes contact with a 2-1 changeup from pitcher Sean Newcomb. Both outcomes resulted in a single for the hitter.
+
+Back in the 1940's, 1960's, even the 1990's, we wouldn't think twice about the two events. Both plate appearances ended in a single and therefore chalk it up as 1/1 for the batter. It doesn't matter if you squib a ball in the perfect spot, get a little lucky, and reach base or you hit a line drive 300ft plus over the outfielders head. If both events result in the same event, consider them to be equal.
+
+Of course, our eyes tell us a very different story. We know that one hitter made much better contact with the ball than the other. Though the outcome was the same, surely we should take this information into account when analyzing the performance of a player. Fortunately, with advancements in technology, we are able to do just that. $\textbf{Statcast}$, introduced in 2015, provides data that tracks all sorts of measurements allowing us to analyze baseball in ways we could never do before.
+
+In 2016, Bill Petti sought to research this matter with his article "Using Statcast Data to Predict Hits". Other resources such as Richard Roberts 2019 article, "How does MLB calculate expected statistics?" and the book "Analyzing Baseball Data with R" by Max Marchi, Jim Albert, and Benjamin S. Baumer contributed to the inspiration of this report. In the report, we will introduce Statcast technology, demonstrate some of the tools of Statcast by exploring the 2018 data, and apply this technology to model the outcomes of pitches put into play. Our motivation is to use the tools provided by Statcast to better assess player performance.
+
+
+```{r, echo=FALSE}
+# Get Data for Different Singles
+
+y <- as_tibble(sc_18)
+y <- y %>%
+      filter(events == "single") %>%
+      arrange(launch_speed)
+y <- rbind(y[2,], y[2000,], y[6000,],y[12000,], y[18000,], y[24000,], y[26112,])
+y <- y[,c(3,6,18,19,23,53,54)]
+y %>%
+  kbl(caption = "Singles from the 2018 Season") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed")) %>%
+  row_spec(c(1,7), bold = T)
+```
+
+
+Table 1: Bolded are the results described from DJ LeMahieu and Giancarlo Stanton along with some other singles from the 2018 season. Columns are the speed of the pitch, player name, hitter stand (left or right), pitcher throw (left or right), fielder the ball was hit to, hit distance, and exit velocity of the ball.
+
+# The Statcast Data
+
+Statcast is a cutting-edge technology implemented in all 30 MLB (Major League Baseball) parks in the year 2015. It allows for the collection and analysis of large amounts of baseball data in ways that were never possible in the past. We can think of Statcast as the future of how we consume and think about the sport of baseball. Initially, pitch tracking was installed in each park and Statcast added to the innovation with the tracking of players and the batted balls.
+
+Since 2015, Statcast has advanced the way games are viewed and decisions are made. Before we would emphasize "old school" statistics such as runs, RBI (runs batted in), and ERA (earned run average). While these statistics still hold value, terms like "spin rate", "exit velocity", and "launch angle" have become more common not just on your local broadcasts but from the players on the field. Today, front offices for every team are analyzing these advanced stats to garner some advantage over the competition.
+
+## What Can We Learn from Statcast?
+
+Statcast reports many measurements. To give an idea of these measurements, below is list of several.
+
+$\textbf{Arm Strength}$ - how hard, in miles per hour, a fielder throws the ball
+
+$\textbf{Base-to-base Time}$ - how much time, in seconds, it takes a runner to get from one base to another
+
+$\textbf{Distance Covered}$ - how far, in feet, a fielder or runner has traveled on a play
+
+$\textbf{Lead Distance}$ - how far, in feet, a runner is ranging off the bag at the time of a pitcher's pitch release.
+
+$\textbf{Pop Time}$ - how quickly, in seconds, a catcher can get the ball out of his glove and to the base on a stolen base attempt.
+
+$\textbf{Spin Rate}$ - how much spin, in revolution per minute, a pitch was thrown with.
+
+Let's dig into some of these variables and see what information we can find.
+
+
+```{r echo=FALSE, warning=FALSE}
+# Combine MLBID with Statcast Data
+
+eda_2018 <- merge(MLBID, sc_18, by.x = "MLBID", by.y = "pitcher")
+eda_2018 <- as.tibble(eda_2018) # make tibble for dplyr
+
+rm(sc_18) # remove sc_18 from global environment
+
+TopStrikeZone <- 3.5
+BotStrikeZone <- 1.5
+LeftStrikeZone <- -0.85
+RightStrikeZone <- 0.85
+StrikeZone <- data.frame(
+  x=c(LeftStrikeZone, LeftStrikeZone, RightStrikeZone, RightStrikeZone, LeftStrikeZone),
+  y=c(BotStrikeZone, TopStrikeZone, TopStrikeZone, BotStrikeZone, BotStrikeZone))
+```
+
+```{r, echo=FALSE}
+fig1 <- ggplot(data = eda_2018 %>% 
+         filter(type == "X")) +
+         geom_bar(mapping = aes(x = hit_location), color = "black", fill = "darkgreen") + 
+         labs(title = "1: First Fielder", x = "Position")
+fig2 <- ggplot(data = eda_2018 %>%
+         filter(fielding_team == "HOU" | fielding_team == "OAK" |
+                fielding_team == "LAA" | fielding_team == "SEA" | fielding_team == "TEX",
+                if_fielding_alignment != "null")) +
+         geom_bar(mapping = aes(x = fielding_team, fill = if_fielding_alignment), color = "black") +
+         labs(title = "2: Infield Shifts (AL West)", x = "AL West Team", fill = "Shift Type")
+ggarrange(fig1, fig2, nrow = 1, ncol = 2)
+```
+
+The old adage, "defense wins championships". If you're a sports fan, you've heard the saying countless times. Statcast provides valuable metrics for defense such as the first fielder to touch a ball and the alignment of the fielders for every pitch. Figure 1 shows a plot for the count of the fielder who first touched the ball when hit into play. The infield is made up of 3 (First Baseman), 4 (Second Baseman), 5 (Third Baseman), and 6 (Shortstop). The outfield is made up of 7 (Left Fielder), 8 (Center Fielder), and 9 (Right Fielder). Among outfielders the plot shows the center fielder is fielding most balls and among infielders the plot shows shortstop and second baseman are fielding most balls. Hence, it makes sense why teams want a defense that is "strong up the middle" of the diamond. Figure 2 looks at the infield shift tendencies for the 5 AL West Teams. Since the rise of advanced statistics in baseball, infield shifting to prevent hitter success has risen. Notice how Houston, a team that has embraced advanced stats, is shifting their infield by far the most.
+
+
+```{r echo=FALSE, warning=FALSE}
+fig3 <- ggplot(data = eda_2018 %>%
+         filter(PLAYERNAME == "Clayton Kershaw", pitch_type != "null", stand == "L")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = pitch_type)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1,col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         labs(title = "3: Clayton Kershaw Pitching to Left-Handers",
+              x = "Horitzonal Position of Ball", y = "Vertical position of Ball", color = "Pitch Type")
+fig3
+```
+
+
+```{r echo=FALSE}
+fig4 <- ggplot(data = eda_2018 %>%
+         filter(PLAYERNAME == "Clayton Kershaw", pitch_type != "null")) +
+         geom_density(mapping = aes(x = release_speed, color = pitch_type)) +
+         labs(title = "4: Clayton Kershaw Pitch Velocity",
+              x = "Pitch Velocity (mph)", color = "Pitch Type")
+fig4
+```
+
+
+With Statcast we can dive into the details of each individual pitcher. Clayton Kershaw, is a left handed pitcher for the Los Angeles Dodgers and, by all accounts, one of the best pitchers of all time. Figure 3 plots the mix of his pitches to left handed hitters in the 2018 season. The tendency is for Kershaw to throw his pitches down and away to left handed hitters, in particular his slider. Figure 4 shows the distribution of each pitch type by velocity. Kershaw's fastball (blue) ranges from 87-96 mph with a mode of what looks somewhere around 92 mph. His curveball (green) ranges from 70-76 mph with a mode of about 74 mph. Having data like this on hand is essential for a team trying to asses a pitchers recent performance.
+
+
+```{r echo=FALSE, warning=FALSE}
+fig5 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Mookie Betts",
+                description == "swinging_strike" | description == "called_strike")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("magenta","blue")) +
+         labs(title = "5: Mookie Betts Strikes (670 Pitches)",
+              x = "Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig5
+```
+
+
+```{r echo=FALSE, warning=FALSE}
+fig6 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Justin Upton",
+                description == "swinging_strike" | description == "called_strike")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("magenta","blue")) +
+         labs(title = "6: Justin Upton Strikes (725 Pitches)",
+              x = "Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig6
+```
+
+
+Comparing hitter tendencies is powerful with Statcast. Figure 5 and 6 plot the 2018 called strikes and swinging strikes for most valuable player award winner Mookie Betts and the struggling Justin Upton. The plot shows Mookie Betts swinging far less in and out of the strikezone. When he does swing and miss, it tends to be down and away. On the other hand, Justin Upton swung and missed a fair amount in the strikezone as well as the top of the zone and down and away.
+
+
+```{r echo=FALSE, warning=FALSE}
+fig7 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Mookie Betts", pitch_type == "SL",
+                description == "swinging_strike" | description == "ball")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("orange","blue")) +
+         labs(title = "7: Mookie Betts vs. Sliders",
+              x = "Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig7
+```
+
+
+```{r echo=FALSE, warning=FALSE}
+fig8 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Justin Upton", pitch_type == "SL",
+                description == "swinging_strike" | description == "ball")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("orange","blue")) +
+         labs(title = "Justin Upton vs. Sliders",
+              x = "8: Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig8
+```
+
+
+In figure 7 and 8, we investigate further and look at the two hitters performance versus sliders. The orange points represent balls and the blue points represents swinging strikes. Pitchers like to throw Justin Upton a slider down and away because he has a tendency to swing and miss outside the zone. Conversely, Mookie Betts does a great job not swinging at this pitch, therefore making him a much tougher out.
+
+
+```{r echo=FALSE, warning=FALSE}
+fig9 <- ggplot() +
+         geom_density(data = eda_2018 %>%
+         filter(pitch_type == "FF"),
+         mapping = aes(x = release_spin_rate), color = "blue") +
+         geom_density(data = eda_2018 %>%
+         filter(PLAYERNAME == "Gerrit Cole", pitch_type == "FF"),
+         mapping = aes(x = release_spin_rate), color = "red") +
+         labs(title = "9: Gerrit Cole Fastball Spin Rate",
+              x = "Spin Rate of Fastball ", color = "Pitch Type")
+fig10 <- ggplot(data = eda_2018 %>%
+         filter(pitch_type == "FF",
+                fielding_team == "HOU" | fielding_team == "OAK" |
+                fielding_team == "LAA" | fielding_team == "SEA" | fielding_team == "TEX")) +
+         geom_boxplot(mapping = aes(x = fielding_team, y = release_spin_rate), color = "red") +
+         labs(title = "10: AL West Fastball Spin Rate",
+              x = "AL West Team", y = "Spin Rate (rpm)", color = "Pitch Type")
+fig11 <- ggplot(data = eda_2018 %>%
+         filter(pitch_type == "FF")) +
+         geom_point(mapping = aes(x = release_speed, y = release_spin_rate), color = "green") +
+         geom_abline() +
+         labs(title = "11: Fastball Spin vs. Velocity",
+              x = "Velocity (mph)", y = "Spin Rate (rpm)", color = "Pitch Type")
+fig12 <- ggplot(data = eda_2018 %>%
+         filter(pitch_type == "CH")) +
+         geom_point(mapping = aes(x = release_speed, y = release_spin_rate), color = "blue") +
+         geom_abline() + 
+         labs(title = "12: Change-up Spin vs. Velocity",
+              x = "Velocity (mph)", y = "Spin Rate (rpm)", color = "Pitch Type")
+
+rm(eda_2018) # remove eda_2018 from global environment
+ggarrange(fig9, fig10, fig11, fig12, nrow = 2, ncol = 2)
+```
+
+
+As mentioned earlier, spin rate measures the rate at which baseballs spin as they approach the plate. Higher spin fastballs tend to be more effective at getting swinging strikes. Figure 9 compares the league average spin rate for a fastball (in blue) with the spin rate of Gerrit Cole. We see that the Cole, one of the best pitchers in baseball, is far out performing league average. Figure 10 shows the fastball spin rate for each of the 5 AL West teams. Houston tendency tend to outperform the competition when it comes to spin rate. Figure 11 displays the relationship between fastball spin and velocity. There is a positive relationship between the two. Something we may want to look into when evaluating pitchers. On the other side, figure 12 presents the relationship between change-up spin and velocity. Change-ups are often thrown intentionally to have less spin and speed in order to deceive the hitter. This can explain why the relationship between velocity and spin is not as clear.
+
+# Our Task: Using Statcast to Predict Hits
+
+We would like to build a model to predict whether a pitch that was put in play resulted in a hit or not. The data consists of over 115,000 pitches that were put into play during the 2018 season. I considered a number of variables for the model.
+
+$\textbf{Launch Angle}$ - launch angle of the batted ball
+
+$\textbf{Launch Speed}$ - exit velocity (miles per hour) of the batted ball
+
+$\textbf{Hit Distance}$ - projected hit distance (ft) of the batted ball
+
+$\textbf{HC-X}$ - hit coordinate X of batted ball
+
+$\textbf{HC-Y}$ - hit coordinate Y of batted ball
+
+$\textbf{Spray Angle}$ - the direction in the field the ball is hit
+
+$\textbf{Stand}$ - side of the plate batter is standing (right or left)
+
+$\textbf{Fielding Team}$ - fielding team
+
+$\textbf{Hit Count}$ - pre-pitch number of balls and strikes
+
+Although not listed in the original data, I introduced the predictors "spray_angle", "fielding_team", and "hit count". Spray angle was considered because it makes sense that a ball hit down the right field line won't have the same hit probability as a ball hit toward center field. This predictor is a function of "hc_x" and "hc_y" however, so it may not be of as much use when it comes to modeling. Left handed and right handed hitting profiles can differ along with the defense of each team. For that reason, fielding team and hit count were explored.
+
+# Exploratory Data Analysis for our Problem
+
+Before modeling, we take some time to explore the data to see if we can find interesting patterns and relationships.
+
+```{r, echo=FALSE}
+M <- cor(df[,1:6])
+corrplot(M, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+```
+
+
+Above, we see the correlation between our six numeric predictors. Most of the correlation is minimal aside from the "hc_y" variable being correlated with "hit_distance_sc", "launch_angle", and "launch_speed". Naturally, this makes sense. The angle and the speed of which the ball is hit will influence where it lands.
+
+
+```{r, echo=FALSE}
+fig13 <- ggplot(data = df, mapping = aes(x = launch_angle, y = launch_speed, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "13: Launch Angle vs. Exit Velo",
+               x = "Launch Angle (deg)", y = "Launch Speed (mph)")
+fig14 <- ggplot(data = df, mapping = aes(x = spray_angle, y = launch_speed, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "14: Spray Angle vs. Exit Velo",
+               x = "Spray Angle (deg)", y = "Launch Speed (mph)")
+fig15 <- ggplot(data = df, mapping = aes(x = launch_angle, y = spray_angle, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "15: Launch Angle vs. Spray Angle",
+               x = "Launch Angle (deg)", y = "Spray Angle (deg)")
+fig16 <- ggplot(data = df, mapping = aes(x = hc_x, y = hc_y, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "16: Hit X vs. Hit Y",
+               x = "Hit coordinate X of Batted Ball", y = "Hit coordinate Y of Batted Ball")
+ggarrange(fig13, fig14, fig15, fig16, nrow = 2, ncol = 2)
+```
+
+
+In the plots above, green represent hits and red represents not hits. 
+
+Figure 13: There's a "sweet spot" for launch angle around 15-30 degrees where most of the hits fall. Not surprisingly, harder hit balls generate more hits.
+
+Figure 14: There is a distinct separation of hits and outs at launch speeds around 50 mph. This relationship extends throughout the range of spray angle.
+
+Figure 15: A negative launch angle (ground ball) is not the way to get a hit. An exception might be made for a ground ball up the middle but even this is in doubt with infield shifts. There is more green along the left field line (-1). This seems like a good place to hit the ball.
+
+Figure 16: Most hits falls in front of the outfielder or over their heads. This puts emphasis on hitting line drives or fly balls as opposed to ground balls.
+
+
+```{r echo=FALSE}
+fig17 <- ggplot(data = df) +
+          geom_bar(mapping = aes(x = stand, fill = ba_outcome), color = "black") +
+          scale_fill_manual(values = c("green","darkred")) +
+          labs(title = "17: Hits by Handendness", x = "Stand", fill = "Outcome")
+fig18 <- ggplot(data = df) +
+          geom_bar(mapping = aes(x = hit_count, fill = ba_outcome), color = "black") + 
+          scale_fill_manual(values = c("green","darkred")) +
+          labs(title = "18: Hits by Hitter's Count", x = "Hitter's Count", fill = "Outcome")
+ggarrange(fig17, fig18, nrow = 2, ncol = 1)
+```
+
+
+Figure 17 shows the breakdown hits between right handed hitters and left handed hitters. Not surprisingly there isn't much difference. Figure 18 shows hits based on the pre-pitch count. Interestingly, there isn't much difference between the different counts when it comes to percentage of hits. One would think that a 2-0 (favorable hitting) count would suggest a clear advantage for hits as opposed to an 0-2 (favorable pitching) count, but the data does not suggest that. Not much data is shown for 3-0 counts because hitters rarely swing in such situations.
+
+## Best Subset Selection
+
+It is often the case that some or many of the predictors used in a multiple regression model are not associated with the response. Best subset selection is an approach that involves identifying a subset of the predictors that we believe to be related to the response. To perform best subset selection, we fit a separate least squares regression for each possible combination of the p predictors. In our case, p = 9. We then look at all the models, with the goal of identifying the "best" one. Objective measures such as Mallows $C_p$, $BIC$, $RSS$, and $adjusted\:R^2$ can be used to determine the best model.
+
+```{r echo=FALSE, warning=FALSE}
+regfit.full <- regsubsets(ba_outcome~., data = df, nvmax = 9)
+reg.summary <- summary(regfit.full)
+```
+
+```{r echo=FALSE, warning=FALSE}
+par(mfrow = c(2,2))
+plot(reg.summary$cp, xlab = "Number of Variables", ylab = "CP", type = "l")
+plot(reg.summary$bic, xlab = "Number of Variables", ylab = "BIC", type = "l")
+plot(reg.summary$rss, xlab = "Number of Variables", ylab = "RSS", type = "l")
+plot(reg.summary$adjr2, xlab = "Number of Variables", ylab = "Adjusted RSq", type = "l")
+```
+
+```{r echo=FALSE, warning=FALSE}
+coef(regfit.full, 5)
+```
+
+
+The plots above show $C_p$, $BIC$, $RSS$, and $adjusted\:R^2$ for the best models of each size. Our goal is to minimize $C_p$, $BIC$, $RSS$ and maximize $adjusted\:R^2$. For each plot, it seems that around 5 variables, there is a plateau. The 5 variable model that we will use involves the predictors launch angle, launch speed, hit distance, hit-coordinate y, and spray angle.
+
+## K-Means Clustering
+
+Clustering is a statistical method for finding subgroups in our data set. When we cluster, we seek to partition the observations into distinct groups so that the observations within each group are similar to each other. K-means is a simple method of clustering for numeric predictors. To perform, K-means clustering. we first need to specify the number of clusters K, then the algorithm assigns each observation to one of the K clusters based on Euclidean distance.
+
+In cluster analysis, the elbow method is a common approach for determining K, the number of clusters. The method consists of plotting the explained variation as a function of the number of clusters and picking the "elbow" of the curve as the number of clusters to use.  We can use the "elbow" to choose a point where diminishing returns is no longer worth the additional cost. In essence, we should choose the number of clusters so that adding another cluster doesn't give much better results.
+
+```{r echo=FALSE, warning=FALSE}
+set.seed(1)
+X <- df[,c(1:3,5,6)] # predictors
+
+# We sample 5000 random rows because data is too large and receiving RAM errors
+X <- X[sample(nrow(X), size = 5000),]
+X <- scale(X) # scale variables
+k2 <- kmeans(X, centers = 2, nstart = 25)
+k3 <- kmeans(X, centers = 3, nstart = 25)
+k4 <- kmeans(X, centers = 4, nstart = 25)
+k5 <- kmeans(X, centers = 5, nstart = 25)
+
+fviz_nbclust(X, kmeans, method = "wss") # elbow method
+```
+
+
+The plot of the optimal number of clusters shows a sharp "elbow" at cluster 2. Cluster 3, 4, and 5, all seems reasonable also and may want to be considered.
+
+
+```{r echo=FALSE, warning=FALSE}
+# Comparing clusters
+p1 <- fviz_cluster(k2, geom = "point", data = X) + ggtitle("k = 2")
+p2 <- fviz_cluster(k3, geom = "point", data = X) + ggtitle("k = 3")
+p3 <- fviz_cluster(k4, geom = "point", data = X) + ggtitle("k = 4")
+p4 <- fviz_cluster(k5, geom = "point", data = X) + ggtitle("k = 5")
+
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+```
+
+
+Plots above show the visuals for K = 2, 3, 4, or 5 clusters. There's more overlap in 3, 4, and 5 clusters as opposed to 2 clusters. Analayzing 2 clusters is a logical choice.
+
+
+```{r echo=FALSE, warning=FALSE}
+Cluster <- c(1,2)
+Launch_Angle <- c(0.6896526, -0.7489219)
+Launch_Speed <- c(0.2724195, -0.2958314)
+Hit_Distance <- c(0.8441786, -0.9167279)
+Hit_Y <- c(-0.7495764, 0.8139955)
+Spray_Angle <- c(0.01589557, -0.01726164)
+table2 <- as.tibble(data.frame(Cluster, Launch_Angle, Launch_Speed, Hit_Distance, Hit_Y, Spray_Angle))
+
+table2 %>%
+  kbl(caption = "Summary of Cluster Means (Scaled)") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+
+Table 2 compares the means for each cluster. Note that the variables for scaled before performing clustering. Nonetheless, we can see that the launch angle, launch speed, hit distance, and hit y coordinate are much higher in cluster 1 than cluster 2. The clustering algorithm is separating "good" batted balls with "bad" batted balls. Clusters 1 tends to be harder hit fly balls and cluster 2 are weaker hit ground balls.
+
+## Principal Component Analysis (PCA)
+
+When faced with a large set of variables, principal component analysis (PCA) allows us to summarize these variables with a smaller number of representative variables that together explain most of the variability in the original data set. PCA is an unsupervised learning approach since it only involves a set of predictors and no associated response. We explore using PCA with our data.
+
+```{r, echo=FALSE}
+# X <- df[,c(1:6)]
+X <- df[,c(1:3,5,6)] # predictors
+res.pca <- prcomp(X, scale = TRUE)
+pca1 <- fviz_eig(res.pca)
+pca2 <- fviz_pca_biplot(res.pca, invisible = "ind")
+
+grid.arrange(pca1, pca2, ncol = 2)
+```
+
+
+Typically, the number of principal components used is determined by examining a scree plot. Above, most of the variation in the data is explained through the first and second principal components. There isn't much difference in using 3 principal components but there is improvement going from 3 to 4.
+
+A 2-dimensional biplot represents the information contained in the first two principal components. It is an approximation of the original multidimensional space. Most of our variables are in the horizontal directions and being explained through principal component 1. For example, low values of principal component 1 correspond to high launch angle values. Spray angle is has a positive relationship with principal component 2.
+
+For the purposes of our problem, it is not necessary to reduce the number of variables into principal components. We were able to cut variables through best subset selection earlier. Still, PCA is a useful statistical tool to explore the data.
+
+# Modeling for our Problem 
+
+To predict the outcome of a pitch put into play, we consider several classification models. In addition, k-fold cross validation is performed for each model. K-fold cross-validation involves randomly dividing the set of observations into k groups, or folds, of approximately equal size. The first fold is treated as a test set and the method is to fit our model on the remaining k-1 folds. This procedure is repeated k times; each time, a different group of observations is treated as a test set. As a result, we get k estimates of the test error and the k-fold cross-validation estimate is computed by averaging these values. For our problem, we set k = 5.
+
+The classification models used are logistic regression, random forests, decision trees, adaptive boosting, naive Bayes, and neural networks. We use overall accuracy to determine which model is working best. This is simply the percentage of accurate classifications made ((True Positives + True Negatives) / All Cases).
+
+```{r, echo=FALSE}
+df <- df[,c(1:3,5,6,10)] # select predictors with response
+df <- df %>%
+  mutate_if(is.numeric, scale) # scale variables for modeling
+```
+
+```{r, echo=FALSE}
+# K-fold Cross Validation Set-UP
+
+  n <- nrow(df)
+  k <- 5 # 5-fold cross validation
+  df <- df[sample(x = n, size = n, replace = FALSE), ]
+  ba.accuracy <- rep(0,6) # initialize accuracy vector
+  ba.standard.error <- rep(0,6) # initialize standard error vector
+
+  # create our "k.folds" matrix that splits data into train and test
+  set.seed(533)
+  sample.rows <- sample(1:n)
+  cols <- floor(n/k)
+  k.folds <- matrix(sample.rows[1:(cols*k)], nrow = k)
+```
+
+## Model 1: Logistic Regression
+
+Logistic regression is a generalized linear model that uses the logistic function to model a binary dependent variable. In our case, we seek to predict the probability that the dependent variable, outcome, belongs to category, "hit" or "not hit". The response variable is dummy coded to "0" or "1" and the the log-odds for the value categorized as "1" is a linear combination of the predictors.
+
+```{r, echo=FALSE}
+# Model 1: Logistic Regression
+
+glm.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df[test.index,]
+  train <- df[train.index,]
+    
+  # fit the logistic regression model
+  
+  glm.model <- glm(ba_outcome~., data = train, family = binomial)
+  glm.pred <- predict(glm.model, test, type = "response")
+  glm.confusion.matrix <- table(actual = test$ba_outcome, predicted = glm.pred > 0.5)
+  glm.accuracy[i] <- (glm.confusion.matrix[1,1] + glm.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[1] <- sum(glm.accuracy) / k
+  ba.standard.error[1] <- sd(glm.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+```{r echo=FALSE, warning=FALSE}
+# Tuning for our models: Random Forest and Decision Trees
+
+set.seed(533)  # for reproducibility
+
+  # Tuning for Random Forest
+
+  train.tune <- sample(x = nrow(df), size = 1000)
+  # Try using 1000 random observations from the data set for tuning purposes.
+
+  tune.rf <- tune.randomForest(x = df[train.tune, 1:5], y = df[train.tune, 6],
+                               formula = ba_outcome~., data = df,
+                               mtry = seq(from = 2, to = 6, by = 1),
+                               ntree = seq(from = 10, to = 100, by = 5))
+  # the format of the arguments is important; see help documentation
+  best.mtry <- tune.rf$best.parameters[1,1]
+  best.ntree <- tune.rf$best.parameters[1,2]
+  
+  # Tuning for Decision Trees
+  
+  tune.dtree <- tune.rpart(formula = ba_outcome~., data = df[train.tune,],
+                           minsplit = seq(from = 10, to = 100, by = 5),
+                           cp = seq(from = 0.01, to = 0.2, by = 0.01))
+  best.minsplit <- tune.dtree$best.parameters[1,1]
+  best.cp <- tune.dtree$best.parameters[1,2]
+```
+
+## Model 2: Decision Trees
+
+For a classification tree model, we predict that each observation belongs to the most commonly occurring class of training observations in the region for which it belongs. We use recursive binary splitting to grow a classification tree. Decision trees are among the most popular machine learning algorithms given their simplicity and interpretability.
+
+```{r, echo=FALSE}
+# Model 2: Decision Trees
+
+tree.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df[test.index,]
+  train <- df[train.index,]
+    
+  # fit the decision tree model
+  
+  tree.model <- rpart(formula = ba_outcome~., data = train,
+                     control = rpart.control(minsplit = best.minsplit, cp = best.cp))
+  tree.pred <- predict(tree.model, test, type = "class")
+  tree.confusion.matrix <- table(tree.pred, test$ba_outcome)
+  tree.accuracy[i] <- (tree.confusion.matrix[1,1] + tree.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[2] <- sum(tree.accuracy) / k
+  ba.standard.error[2] <- sd(tree.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+## Model 3: Random Forests
+
+With random forests, we build decision trees on training samples but each time a split in a tree is considered, a random sample of predictors is chosen as split candidates from the full set of predictors. In doing this, the model “decorrelates” the trees and thereby making the average of the resulting tress less variable and hence more reliable.
+
+```{r, echo=FALSE}
+# Model 3: Random Forests
+
+rf.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df[test.index,]
+  train <- df[train.index,]
+    
+  # fit the random forests model
+  
+  ba.rf.model <- randomForest(ba_outcome~., data = train, ntree = best.ntree, mtry = best.mtry)
+  rf.pred <- predict(ba.rf.model, test)
+  rf.confusion.matrix <- table(rf.pred, test$ba_outcome)
+  rf.accuracy[i] <- (rf.confusion.matrix[1,1] + rf.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[3] <- sum(rf.accuracy) / k
+  ba.standard.error[3] <- sd(rf.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+## Model 4: Adaptive Boosting
+
+Adaptive Boosting is a strong machine learning tool that combines multiple "weak classifiers" into a single "strong classifier". Unlike fitting a single large decision tree, the boosting algorithm instead learns slowly. A tree is fit using the current residuals, rather than the outcome, as the response. Trees are then added in order to update the residuals and improve results.
+
+```{r, echo=FALSE}
+# Model 4: Adaptive Boosting
+
+boosting.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df[test.index,]
+  train <- df[train.index,]
+
+  # fit the boosting model
+  
+  boosting.model <- boosting(formula = ba_outcome~., data = train, boos = TRUE, mfinal = 10)
+  boosting.pred <- predict.boosting(object = boosting.model, newdata = test)
+  boosting.confusion.matrix <- boosting.pred$confusion
+  boosting.accuracy[i] <- (boosting.confusion.matrix[1,1] + boosting.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[4] <- sum(boosting.accuracy) / k
+  ba.standard.error[4] <- sd(boosting.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+## Model 5: Naive Bayes
+
+Naive Bayes is a probabilistic machine learning model that's used for classification. The algorithm is based on the famous Bayes Theorem. Bayes Theorem states that given events A and B, $P(A|B) = \frac{P(B|A)P(A)}{P(B)}$. In using Naive Bayes, we assume that the predictors are independent. In addition, the assumption that all predictors have an equal effect on the outcome is made.
+
+```{r, echo=FALSE}
+# Model 5: Naive Bayes
+
+nb.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df[test.index,]
+  train <- df[train.index,]
+
+  # fit the naive Bayes model
+  
+  nb.model <- naiveBayes(formula = ba_outcome~., data = train)
+  nb.pred <- predict(nb.model, test, type = "class")
+  nb.confusion.matrix <- table(nb.pred, test$ba_outcome)
+  nb.accuracy[i] <- (nb.confusion.matrix[1,1] + nb.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[5] <- sum(nb.accuracy) / k
+  ba.standard.error[5] <- sd(nb.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+## Model 6: Neural Networks
+
+Neural networks learn by comparing their classification of the response with the actual classification of the response. Errors from the classification are fed into the network and used to modify the networks algorithm for further iterations. A neuron in a neural network is a set of input values and weights along with a function that sums the weights and maps the results to an output. There are three layers to the neuron: input, hidden, and output. One iteration through the network assigns a value to each output node and the response is assigned to the class node with the highest value. For our problem, we've used a neural network with 3 hidden layers.
+
+```{r, echo=FALSE, results='hide'}
+# Model 6: Neural Network
+
+nn.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df[test.index,]
+  train <- df[train.index,]
+
+  # fit the neural networks model
+  
+  nn.model <- nnet(ba_outcome~., data = train, size = 3)
+  nn.pred <- predict(nn.model, test, type = "class")
+  nn.confusion.matrix <- table(nn.pred, test$ba_outcome)
+  nn.accuracy[i] <- (nn.confusion.matrix[1,1] + nn.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[6] <- sum(nn.accuracy) / k
+  ba.standard.error[6] <- sd(nn.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+## Comparing the Models
+
+```{r, echo=FALSE}
+Model <- c("Logit","Trees","R_Forest","Boosting","Naive_Bayes","NNets")
+Accuracy <- c(72.67, 87.05, 92.45, 90.37, 71.36, 88.89)
+Standard_Error <- c(0.0020, 0.0007, 0.0007, 0.0011, 0.0017, 0.0034)
+table3 <- as.tibble(data.frame(Model, Accuracy, Standard_Error))
+
+table3 %>%
+  kbl(caption = "Summary of Model Results for Hit vs. Not Hit") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+```{r, echo=FALSE}
+names(ba.accuracy) <- c("Logit","Trees","R_Forest","Boosting","Naive_Bayes","NNets")
+names(ba.standard.error) <- c("Logit","Trees","R_Forest","Boosting","Naive_Bayes","NNets")
+ba.df <- as.data.frame(cbind(ba.accuracy,ba.standard.error))
+
+ggplot(data = ba.df, mapping = aes(x = rownames(ba.df), y = ba.accuracy, color = rownames(ba.df))) +
+  geom_point() +
+  geom_errorbar(data = ba.df, mapping = aes(ymin = ba.accuracy-ba.standard.error, ymax = ba.accuracy+ba.standard.error),
+                width = 0.2, position = position_dodge(0.05)) +
+  labs(title = "Cross-Validation Accuracy Rate for Each Model",
+       x = "Model", y = "Accuracy Rate", color = "Model")
+```
+
+
+The table and plot above display the results from our 6 models. The logistic regression and naive Bayes model are clearly performing the worst. Decision trees, boosting, and neural networks are competitive models but the random forests model is the clear winner with a classification accuracy of 92.45%.
+
+# Multi-Classification: Can we do Better?
+
+We have managed to construct a model that accurately classifies a batted pitch as a hit or not hit 92.45%, but of course a hit can be classified as a single, double, triple, or home run. Can we construct a model to determine whether a such hit is a single, double, triple, or home run. After all, a hitter with 40 home runs and 100 singles is far more valuable than a player with 10 home runs and 140 singles.
+
+## Exploratory Data Analysis: Multi-Classification
+
+```{r, echo=FALSE}
+fig19 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = launch_angle, y = launch_speed, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "19: Launch Angle vs. Exit Velo",
+               x = "Launch Angle (deg)", y = "Launch Speed (mph)", color = "Outcome")
+fig20 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = spray_angle, y = launch_speed, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "20: Spray Angle vs. Exit Velo",
+               x = "Spray Angle (deg)", y = "Launch Speed (mph)", color = "Outcome")
+ggarrange(fig19, fig20, nrow = 2, ncol = 1)
+```
+
+Figure 19: A launch angle of 25-35 with a launch speed over 100 mph usually results in a home run. Doubles are scattered right below the home runs indicating that they are usually not hit as hard. There is no clear pattern with triples. This is not surprising seeing as triples rarely occur and when they do, it is sometimes due to a lucky bounce of the ball.
+
+Figure 20: Doubles are often hit down the left and right field line. Almost all home runs are hit over 100 mph with most going in the direction of left field. 
+
+```{r, echo=FALSE}
+fig21 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = launch_angle, y = spray_angle, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "21: Launch Angle vs. Spray Angle",
+               x = "Launch Angle (deg)", y = "Spray Angle (deg)", color = "Outcome")
+fig22 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = hc_x, y = hc_y, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "22: Hit X vs. Hit Y",
+               x = "Hit coordinate X of Batted Ball", y = "Hit coordinate Y of Batted Ball",
+               color = "Outcome")
+ggarrange(fig21, fig22, nrow = 2, ncol = 1)
+```
+
+
+Figure 21: Ground balls are not a good thing. Launch angles above 0 are where the majority of extra base hits are coming from.
+
+Figure 22: As we would expect, doubles are scattered down along the left and right field lines. The placing of a triple is very difficult to predict.
+
+
+```{r echo=FALSE}
+fig23 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single")) +
+          geom_bar(mapping = aes(x = stand, fill = slg_outcome), color = "black") +
+          labs(title = "23: Extra-Base Hits by Handendness",
+               x = "Stand", fill = "Outcome")
+fig24 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single")) +
+          geom_bar(mapping = aes(x = hit_count, fill = slg_outcome), color = "black") + 
+          labs(title = "24: Extra-Base Hits by Hitter's Count",
+               x = "Hitter's Count", fill = "Outcome")
+ggarrange(fig23, fig24, nrow = 2, ncol = 1)
+```
+
+Figure 23: The percentage of doubles and home runs between left handed and right handed hitters is not too different. The percentage of hits that are triples is higher among left handers. 
+
+Figure 24: Most balls that are put into play occur in the first pitch of the at bat. Data shows that in favorable hitter accounts such as 2-0 and 3-1, hitters are more selective about what pitches to hit. The percentage of hits that are home runs is pretty even among the counts although in an 0-2, chances of a home run are slimmer.
+
+## Bonus Modeling!
+
+We seek to model the probability of a hit, but this time, separating our hits into different classes. To do this, we can bring back the competitive models used earlier that can also be applied in the multi-classification setting. Again, K-fold cross validation is used with the same predictor variables. The models considered were decision trees, random forests, boosting, and neural networks.
+
+```{r, echo=FALSE}
+df2 <- df2[,c(1:3,6,9,10)] # select predictors with response, based on subset selection
+df2 <- df2 %>%
+  mutate_if(is.numeric, scale) # scale variables for modeling
+
+slg.accuracy <- rep(0,4) # initialize accuracy vector
+slg.standard.error <- rep(0,4) # initialize standard error vector
+```
+
+```{r echo=FALSE, warning=FALSE}
+# Tuning for Random Forests and Decision Trees
+
+set.seed(323)  # for reproducibility
+
+  # Tuning for Random Forest
+
+  train.tune <- sample(x = nrow(df2), size = 1000)
+  # Try using 1000 random observations from the data set for tuning purposes.
+
+  tune.rf <- tune.randomForest(x = df2[train.tune, 1:5], y = df2[train.tune, 6],
+                               formula = outcome~., data = df2,
+                               mtry = seq(from = 2, to = 6, by = 1),
+                               ntree = seq(from = 10, to = 100, by = 5))
+  # the format of the arguments is important; see help documentation
+  best.mtry2 <- tune.rf$best.parameters[1,1]
+  best.ntree2 <- tune.rf$best.parameters[1,2]
+  
+  # Tuning for Decision Trees
+  
+  tune.dtree <- tune.rpart(formula = slg_outcome~., data = df2[train.tune,],
+                           minsplit = seq(from = 60, to = 100, by = 5),
+                           cp = seq(from = 0.01, to = 0.2, by = 0.01))
+  best.minsplit <- tune.dtree$best.parameters[1,1]
+  best.cp <- tune.dtree$best.parameters[1,2]
+```
+
+```{r, echo=FALSE}
+# Model 1: Decision Trees
+
+multi.tree.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+    
+  # fit the decision tree model
+  
+  tree.model <- rpart(formula = slg_outcome~., data = train,
+                     control = rpart.control(minsplit = best.minsplit, cp = best.cp))
+  tree.pred <- predict(tree.model, test, type = "class")
+  tree.confusion.matrix <- confusionMatrix(tree.pred, test$slg_outcome)
+  multi.tree.accuracy[i] <- tree.confusion.matrix$overall['Accuracy']
+}
+  slg.accuracy[1] <- sum(multi.tree.accuracy) / k
+  slg.standard.error[1] <- sd(multi.tree.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+```{r, echo=FALSE}
+# Model 2: Random Forests
+
+multi.rf.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+    
+  # fit the random forests model
+  
+  slg.rf.model <- randomForest(slg_outcome~., data = train, ntree = best.ntree2, mtry = best.mtry2)
+  rf.pred <- predict(slg.rf.model, test)
+  rf.confusion.matrix <- confusionMatrix(rf.pred, test$slg_outcome)
+  multi.rf.accuracy[i] <- rf.confusion.matrix$overall['Accuracy']
+}
+  slg.accuracy[2] <- sum(multi.rf.accuracy) / k
+  slg.standard.error[2] <- sd(multi.rf.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+```{r echo=FALSE, warning=FALSE}
+# Model 3: Boosting
+
+multi.boosting.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+
+  # fit the boosting model
+  
+  boosting.model <- boosting(formula = slg_outcome~., data = train, boos = TRUE, mfinal = 10)
+  boosting.pred <- predict.boosting(object = boosting.model, newdata = test)
+  multi.boosting.accuracy[i] <- 1 - boosting.pred$error
+}
+  slg.accuracy[3] <- sum(multi.boosting.accuracy) / k
+  slg.standard.error[3] <- sd(multi.boosting.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+```{r, echo=FALSE, results='hide'}
+# Model 4: Neural Network
+
+multi.nn.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+
+  # fit the neural network model
+  
+  nn.model <- nnet(slg_outcome~., data = train, size = 3)
+  nn.pred <- predict(nn.model, test, type = "class")
+  nn.confusion.matrix <- table(nn.pred, test$slg_outcome)
+  multi.nn.accuracy[i] <- (nn.confusion.matrix[1,2] + nn.confusion.matrix[2,3] +
+                           nn.confusion.matrix[3,1] + nn.confusion.matrix[4,4] ) / nrow(test)
+}
+  slg.accuracy[4] <- sum(multi.nn.accuracy) / k
+  slg.standard.error[4] <- sd(multi.nn.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+## Comparing the Models
+
+```{r, echo=FALSE}
+Model <- c("Trees","R_Forest","Boosting","NNets")
+Accuracy <- c(84.42, 89.61, 85.77, 84.37)
+Standard_Error <- c(0.0009, 0.0004, 0.0038, 0.0031)
+table4 <- as.tibble(data.frame(Model, Accuracy, Standard_Error))
+
+table4 %>%
+  kbl(caption = "Summary of Model Results for Multi-Classification Hits") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+```{r, echo=FALSE}
+names(slg.accuracy) <- c("Trees","R_Forest","Boosting","NNets")
+names(slg.standard.error) <- c("Trees","R_Forest","Boosting","NNets")
+df <- as.data.frame(cbind(slg.accuracy,slg.standard.error))
+
+ggplot(data = df, mapping = aes(x = rownames(df), y = slg.accuracy, color = rownames(df))) +
+  geom_point() +
+  geom_errorbar(data = df, mapping = aes(ymin = slg.accuracy-slg.standard.error, ymax = slg.accuracy+slg.standard.error),
+                width = 0.2, position = position_dodge(0.05)) +
+  labs(title = "Cross-Validation Accuracy Rate for Each Model",
+       x = "Model", y = "Accuracy Rate", color = "Model")
+```
+
+
+The table and plot above display the results from our 4 models. The models are all providing over an 84% accuracy rate. Similar to the results from our binary response models, random forests is the winner with a classification rate of 89.67%.
+
+## Applying the Models
+
+We have created models that classify a hit or not hit and the type of hit with roughly 90% accuracy rate. Now, we can apply these models to analyze an individual player.
+
+In 2019, Arizona Diamondbacks third baseman Eduardo Escobar had arguably his best season recording a 0.269 batting average and 0.511 slugging percentage with 35 home runs. We can use our model to determine his expected singles, doubles, triples, and home runs for the 2019 season and compare them to the actual observed.
+
+```{r, echo=FALSE}
+# Read in 2019 Statcast Data and Prepare Test Data for Modeling and Analysis
+
+sc_19 <- read.csv(file = "statcast_19.csv", header = TRUE)
+
+# Turn categorical variables into factors
+
+sc_19 <- sc_19 %>%
+        mutate_if(is.character, as.factor)
+
+# Identify pitches in play
+temp <- sc_19 %>%
+          filter(type == "X")
+
+# Create new variables "spray_angle" "ba_outcome" and "slg_outcome"
+temp <- mutate(temp, spray_angle = temp$hc_x)
+temp <- mutate(temp, ba_outcome = temp$events)
+temp <- mutate(temp, slg_outcome = temp$events)
+
+# Calculate "spray_angle", formula found in references
+temp$spray_angle <- atan((temp$hc_x-125.42)/(198.27-temp$hc_y))
+
+# Binary "ba_outcome" variable, hit or out
+temp$ba_outcome <- if_else(temp$ba_outcome == "single"|
+                           temp$ba_outcome == "double"|
+                           temp$ba_outcome == "triple"|
+                           temp$ba_outcome == "home_run",
+                           "hit","not_hit")
+
+# Identify "slg_outcome", singles, doubles, triples, and home runs
+temp$slg_outcome <- recode_factor(temp$slg_outcome,
+                             "batter_interference" = "not_hit",
+                              "caught_stealing_2b" = "not_hit",
+                              "caught_stealing_3b" = "not_hit",
+                              "caught_stealing_home" = "not_hit",
+                              "double_play" = "not_hit",
+                              "field_error" = "not_hit",
+                              "field_out" = "not_hit",
+                              "fielders_choice" = "not_hit",
+                              "fielders_choice_out" = "not_hit",
+                              "force_out" = "not_hit",
+                              "grounded_into_double_play" = "not_hit",
+                              "hit_by_pitch" = "not_hit",
+                              "interf_def" = "not_hit",
+                              "null" = "not_hit",
+                              "other_out" = "not_hit",
+                              "pickoff_1b" = "not_hit",
+                              "pickoff_2b" = "not_hit",
+                              "pickoff_3b" = "not_hit",
+                              "pickoff_caught_stealing_2b" = "not_hit",
+                              "pickoff_caught_stealing_3b" = "not_hit",
+                              "pickoff_caught_stealing_home" = "not_hit",
+                              "run" = "not_hit",
+                              "sac_bunt" = "not_hit",
+                              "sac_bunt_double_play" = "not_hit",
+                              "sac_fly" = "not_hit",
+                              "sac_fly_double_play" = "not_hit",
+                              "strikeout" = "not_hit",
+                              "strikeout_double_play" = "not_hit",
+                              "triple_play" = "not_hit",
+                              "walk" = "not_hit")
+
+# Change Outcome to factor variable
+temp <- temp %>% 
+  mutate_if(is.character, as.factor)
+
+# Analyzing player
+p1.train <- filter(temp, player_name != "Eduardo Escobar")
+p1.train <- select(p1.train, c(launch_angle, launch_speed, hit_distance_sc, 
+                      hc_y, spray_angle, ba_outcome, slg_outcome))
+p1.test <- filter(temp, player_name == "Eduardo Escobar")
+p1.test <- select(p1.test, c(launch_angle, launch_speed, hit_distance_sc, 
+                      hc_y, spray_angle, ba_outcome, slg_outcome))
+p1.train <- na.omit(p1.train); p1.test <- na.omit(p1.test)
+```
+
+```{r, echo=FALSE}
+# Eduardo Escobar 2019 results
+
+set.seed(26)
+
+p1.ba.rf.model <- randomForest(ba_outcome ~.-slg_outcome,
+                                  data = p1.train, ntree = best.ntree, mtry = best.mtry)
+p1.ba.rf.pred <- predict(p1.ba.rf.model, p1.test)
+p1.ba.rf.cm <- table(p1.ba.rf.pred, p1.test$ba_outcome)
+p1.ba.rf.accuracy <- (p1.ba.rf.cm[1,1] + p1.ba.rf.cm[2,2]) / nrow(p1.test)
+p1.ba.rf.cm
+
+p1.slg.rf.model <- randomForest(slg_outcome~.-ba_outcome,
+                                   data = p1.train, ntree = best.ntree2, mtry = best.mtry2)
+p1.slg.rf.pred <- predict(p1.slg.rf.model, p1.test)
+p1.slg.rf.cm <- confusionMatrix(p1.slg.rf.pred, p1.test$slg_outcome)
+p1.slg.rf.accuracy <- p1.slg.rf.cm$overall['Accuracy']
+p1.slg.rf.cm$table
+```
+
+```{r, echo=FALSE}
+Player <- "Eduardo Escobar"
+Actual_Hits <- 165
+Predicted_Hits <- 150
+Actual_BA <- 0.3474
+Predicted_BA <- 0.3158
+Actual_SLG <- 0.6589
+Predicted_SLG <- 0.6273
+table5 <- as.tibble(data.frame(Player, Actual_Hits, Predicted_Hits,
+                               Actual_BA, Predicted_BA,
+                               Actual_SLG, Predicted_SLG))
+table5 %>%
+  kbl(caption = "Eduardo Escobar: 2019 Actual vs. Predicted") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+
+While other statistics, such as strikeouts, are factored into batting average and slugging percentage, it is important to remember that we are considering only pitches hit into play. The confusion matrices and table above compare the actual hits from Eduardo Escobar with the models predicted results. Escobar had 165 hits, but the random forest model predicted 150 hits. In addition, the total bases amounted for Escobar were 313 while the model predicted 298. Total bases is the main number used when computing slugging percentage. Total bases is simply calculated with a single equaling 1 base, a double equaling 2 bases, a triple equaling 3 bases, and a home run equaling 4 bases. It appears Escobar may have been a little lucky with his balls hit into play in 2019 making him a potential candidate to regress.
+
+# Conclusion and Future Work
+
+Statistical analysis in baseball is on the rise and will continue to grow with the addition of more and more data. While we've created models to predict the outcome of pitches in play, this is only scratching the surface into hitter analysis. There are countless factors in determining the success of a hitter; park factor, swing and miss rate, plate discipline to list a few. In addition, statistics such as wOBA (Weighted On-Base Average) and wRC (weighted Runs Created) are more indicative of a players performance and being able to predict these is more valuable. 
+
+All 30 Major League Baseball teams have departments dedicated to analytics, so what lies in the future? In recent years, teams have realized how important some of the metrics introduced in this report are but what's of more importance is how to improve upon them. It's one thing knowing a pitcher's spin rate and how it affects his fastball, but can teams now use this information to develop player skills. Driveline Baseball is a growing company based in Washington that leans on data to advance baseball training. High profile players such as Trevor Bauer are strong supporters of the player development programs that they have implemented. The current trend in baseball is to evaluate measurements such as durability and recovery time to have a player perform at his peak.
+
+For future work, I plan to apply similar methods to model more advanced statistics such as wOBA and FIP (fielding independent pitching). Using statcast data to delve into catcher framing and pitch selection is also of interest. If time persists, I hope to research rest and recovery from injury to see how that affects a players performance.
+
+\newpage
+
+# Resources and References
+
+baseballsavant.mlb.com
+
+fangraphs.com
+
+baseballwithr.com
+
+"Analyzing Baseball Data with R" by Marchi, Albert, and Baumer
+
+"Chance of Hit as Function of Launch Angle, Exit Velocity and Spray Angle" by Jim Albert, 2018
+
+"Using Statcast to Predict Hits" by Bill Petti, 2016
+
+"How does MLB calculate expected statistics" by Rusty Roberts, 2019
+
+"Introduction to Statistical Learning" by James, Witten, Hastie, Tibshirani
+
+\newpage
+
+# R:CODE APPENDIX
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# SCRAPPING BASEBALL DATA FROM THE 2018 AND 2019 SEASON
+
+devtools::install_github("BillPetti/baseballr", force = TRUE)
+
+sc1 = scrape_statcast_savant_batter_all(start_date = "2019-03-28", end_date = "2019-04-07")
+sc2 = scrape_statcast_savant_batter_all(start_date = "2019-04-08", end_date = "2019-04-13")
+sc3 = scrape_statcast_savant_batter_all(start_date = "2019-04-14", end_date = "2019-04-19")
+sc4 = scrape_statcast_savant_batter_all(start_date = "2019-04-20", end_date = "2019-04-25")
+sc5 = scrape_statcast_savant_batter_all(start_date = "2019-04-26", end_date = "2019-04-30")
+
+sc6 = scrape_statcast_savant_batter_all(start_date = "2019-05-01", end_date = "2019-05-07")
+sc7 = scrape_statcast_savant_batter_all(start_date = "2019-05-08", end_date = "2019-05-13")
+sc8 = scrape_statcast_savant_batter_all(start_date = "2019-05-14", end_date = "2019-05-19")
+sc9 = scrape_statcast_savant_batter_all(start_date = "2019-05-20", end_date = "2019-05-25")
+sc10 = scrape_statcast_savant_batter_all(start_date = "2019-05-26", end_date = "2019-05-31")
+
+sc11 = scrape_statcast_savant_batter_all(start_date = "2019-06-01", end_date = "2019-06-07")
+sc12 = scrape_statcast_savant_batter_all(start_date = "2019-06-08", end_date = "2019-06-13")
+sc13 = scrape_statcast_savant_batter_all(start_date = "2019-06-14", end_date = "2019-06-19")
+sc14 = scrape_statcast_savant_batter_all(start_date = "2019-06-20", end_date = "2019-06-25")
+sc15 = scrape_statcast_savant_batter_all(start_date = "2019-06-26", end_date = "2019-06-30")
+
+sc16 = scrape_statcast_savant_batter_all(start_date = "2019-07-01", end_date = "2019-07-07")
+sc17 = scrape_statcast_savant_batter_all(start_date = "2019-07-08", end_date = "2019-07-13")
+sc18 = scrape_statcast_savant_batter_all(start_date = "2019-07-14", end_date = "2019-07-19")
+sc19 = scrape_statcast_savant_batter_all(start_date = "2019-07-20", end_date = "2019-07-25")
+sc20 = scrape_statcast_savant_batter_all(start_date = "2019-07-26", end_date = "2019-07-31")
+
+sc21 = scrape_statcast_savant_batter_all(start_date = "2019-08-01", end_date = "2019-08-07")
+sc22 = scrape_statcast_savant_batter_all(start_date = "2019-08-08", end_date = "2019-08-13")
+sc23 = scrape_statcast_savant_batter_all(start_date = "2019-08-14", end_date = "2019-08-19")
+sc24 = scrape_statcast_savant_batter_all(start_date = "2019-08-20", end_date = "2019-08-25")
+sc25 = scrape_statcast_savant_batter_all(start_date = "2019-08-26", end_date = "2019-08-31")
+
+sc26 = scrape_statcast_savant_batter_all(start_date = "2019-09-01", end_date = "2019-09-07")
+sc27 = scrape_statcast_savant_batter_all(start_date = "2019-09-08", end_date = "2019-09-13")
+sc28 = scrape_statcast_savant_batter_all(start_date = "2019-09-14", end_date = "2019-09-19")
+sc29 = scrape_statcast_savant_batter_all(start_date = "2019-09-20", end_date = "2019-09-25")
+sc30 = scrape_statcast_savant_batter_all(start_date = "2019-09-26", end_date = "2019-09-29")
+
+sc31 = scrape_statcast_savant_batter_all(start_date = "2018-03-29", end_date = "2018-04-05")
+sc32 = scrape_statcast_savant_batter_all(start_date = "2018-04-06", end_date = "2018-04-11")
+sc33 = scrape_statcast_savant_batter_all(start_date = "2018-04-10", end_date = "2018-04-17")
+sc34 = scrape_statcast_savant_batter_all(start_date = "2018-04-18", end_date = "2018-04-23")
+sc35 = scrape_statcast_savant_batter_all(start_date = "2018-04-24", end_date = "2018-04-30")
+
+sc36 = scrape_statcast_savant_batter_all(start_date = "2018-05-01", end_date = "2018-05-07")
+sc37 = scrape_statcast_savant_batter_all(start_date = "2018-05-08", end_date = "2018-05-13")
+sc38 = scrape_statcast_savant_batter_all(start_date = "2018-05-14", end_date = "2018-05-19")
+sc39 = scrape_statcast_savant_batter_all(start_date = "2018-05-20", end_date = "2018-05-25")
+sc40 = scrape_statcast_savant_batter_all(start_date = "2018-05-26", end_date = "2018-05-31")
+
+sc41 = scrape_statcast_savant_batter_all(start_date = "2018-06-01", end_date = "2018-06-07")
+sc42 = scrape_statcast_savant_batter_all(start_date = "2018-06-08", end_date = "2018-06-13")
+sc43 = scrape_statcast_savant_batter_all(start_date = "2018-06-14", end_date = "2018-06-19")
+sc44 = scrape_statcast_savant_batter_all(start_date = "2018-06-20", end_date = "2018-06-25")
+sc45 = scrape_statcast_savant_batter_all(start_date = "2018-06-26", end_date = "2018-06-30")
+
+sc46 = scrape_statcast_savant_batter_all(start_date = "2018-07-01", end_date = "2018-07-07")
+sc47 = scrape_statcast_savant_batter_all(start_date = "2018-07-08", end_date = "2018-07-13")
+sc48 = scrape_statcast_savant_batter_all(start_date = "2018-07-14", end_date = "2018-07-19")
+sc49 = scrape_statcast_savant_batter_all(start_date = "2018-07-20", end_date = "2018-07-25")
+sc50 = scrape_statcast_savant_batter_all(start_date = "2018-07-26", end_date = "2018-07-31")
+
+sc51 = scrape_statcast_savant_batter_all(start_date = "2018-08-01", end_date = "2018-08-07")
+sc52 = scrape_statcast_savant_batter_all(start_date = "2018-08-08", end_date = "2018-08-13")
+sc53 = scrape_statcast_savant_batter_all(start_date = "2018-08-14", end_date = "2018-08-19")
+sc54 = scrape_statcast_savant_batter_all(start_date = "2018-08-20", end_date = "2018-08-25")
+sc55 = scrape_statcast_savant_batter_all(start_date = "2018-08-26", end_date = "2018-08-31")
+
+sc56 = scrape_statcast_savant_batter_all(start_date = "2018-09-01", end_date = "2018-09-07")
+sc57 = scrape_statcast_savant_batter_all(start_date = "2018-09-08", end_date = "2018-09-13")
+sc58 = scrape_statcast_savant_batter_all(start_date = "2018-09-14", end_date = "2018-09-19")
+sc59 = scrape_statcast_savant_batter_all(start_date = "2018-09-20", end_date = "2018-09-25")
+sc60 = scrape_statcast_savant_batter_all(start_date = "2018-09-26", end_date = "2018-10-01")
+
+statcast1 <- rbind(sc1, sc2, sc3, sc4, sc5, sc6, sc7, sc8, sc9, sc10, sc11, sc12, sc13, sc14, sc15)
+statcast2 <- rbind(sc16, sc17, sc18, sc19, sc20, sc21, sc22, sc23, sc24, sc25, sc26, sc27, sc28, sc29, sc30)
+statcast3 <- rbind(sc31, sc32, sc33, sc34, sc35, sc36, sc37, sc38, sc39, sc40, sc41, sc42, sc43, sc44, sc45)
+statcast4 <- rbind(sc46, sc47, sc48, sc49, sc50, sc51, sc52, sc53, sc54, sc55, sc56, sc57, sc58, sc59, sc60)
+
+statcast_19 <- rbind(statcast1, statcast2) # every pitch of the 2019 season
+statcast_18 <- rbind(statcast3, statcast4) # every pitch of the 2018 season
+
+write_csv(statcast_19, "statcast_19.csv")
+write_csv(statcast_18, "statcast_18.csv")
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+library(kableExtra) # rmarkdown tables
+library(tidyverse) # loads readr, dplyr, ggplot2 and other useful packages
+library(ggpubr) # ggarrange function
+library(corrplot) # correlation plot
+library(RColorBrewer) # correlation plot
+library(gridExtra) # grid.arrange
+library(leaps) # regsubsets()
+library(factoextra) # clustering
+library(e1071) # tune.randomForest and naiveBayes
+library(randomForest) # for random forest
+library(rpart) # for decision trees
+library(adabag) # for adaptive boosting
+library(caret) # for adaptive boosting
+library(nnet) # for neural networks
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Read in 2018 Statcast data and MLBID
+
+sc_18 <- read.csv(file = "statcast_18.csv", header = TRUE)
+MLBID <- read.csv("MLBID.csv", header = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Prepare 2018 Data for Modeling and Analysis
+
+# Turn categorical variables into factors
+
+sc_18 <- sc_18 %>%
+        mutate_if(is.character, as.factor)
+sc_18 <- mutate(sc_18, fielding_team = ifelse(sc_18$inning_topbot == "Top",
+                                            as.character(sc_18$home_team), 
+                                            as.character(sc_18$away_team)))
+
+# Identify pitches in play
+temp <- sc_18 %>%
+          filter(type == "X")
+
+# Create new variables "hit_count", "fielding_team", "spray_angle", "ba_outcome", "slg_outcome"
+temp <- mutate(temp, hit_count = paste(temp$balls,"-",temp$strikes))
+temp <- mutate(temp, fielding_team = ifelse(temp$inning_topbot == "Top",
+                                            as.character(temp$home_team), 
+                                            as.character(temp$away_team)))
+temp <- mutate(temp, spray_angle = temp$hc_x)
+temp <- mutate(temp, ba_outcome = temp$events)
+temp <- mutate(temp, slg_outcome = temp$events)
+
+# Calculate "spray_angle", formula found in references
+
+temp$spray_angle <- atan((temp$hc_x-125.42)/(198.27-temp$hc_y))
+
+# Binary "ba_outcome" variable, hit or out
+temp$ba_outcome <- if_else(temp$ba_outcome == "single"|
+                           temp$ba_outcome == "double"|
+                           temp$ba_outcome == "triple"|
+                           temp$ba_outcome == "home_run",
+                           "hit","not_hit")
+
+# Identify "slg_outcome", singles, doubles, triples, and home runs
+temp$slg_outcome <- recode_factor(temp$slg_outcome,
+                             "batter_interference" = "not_hit",
+                              "caught_stealing_2b" = "not_hit",
+                              "caught_stealing_3b" = "not_hit",
+                              "caught_stealing_home" = "not_hit",
+                              "double_play" = "not_hit",
+                              "field_error" = "not_hit",
+                              "field_out" = "not_hit",
+                              "fielders_choice" = "not_hit",
+                              "fielders_choice_out" = "not_hit",
+                              "force_out" = "not_hit",
+                              "grounded_into_double_play" = "not_hit",
+                              "hit_by_pitch" = "not_hit",
+                              "interf_def" = "not_hit",
+                              "null" = "not_hit",
+                              "other_out" = "not_hit",
+                              "pickoff_1b" = "not_hit",
+                              "pickoff_2b" = "not_hit",
+                              "pickoff_3b" = "not_hit",
+                              "pickoff_caught_stealing_2b" = "not_hit",
+                              "pickoff_caught_stealing_3b" = "not_hit",
+                              "pickoff_caught_stealing_home" = "not_hit",
+                              "run" = "not_hit",
+                              "sac_bunt" = "not_hit",
+                              "sac_bunt_double_play" = "not_hit",
+                              "sac_fly" = "not_hit",
+                              "sac_fly_double_play" = "not_hit",
+                              "strikeout" = "not_hit",
+                              "strikeout_double_play" = "not_hit",
+                              "triple_play" = "not_hit",
+                              "walk" = "not_hit")
+
+# Change Outcome to factor variable
+temp <- temp %>% 
+  mutate_if(is.character, as.factor)
+
+# Keep variables for analysis
+# df is for binary response (hit or not hit)
+# df2 is for 5 response (single, double, triple, home run, or not hit)
+
+df <- select(temp, c(launch_angle, launch_speed, hit_distance_sc,
+                     hc_x, hc_y, spray_angle, stand, fielding_team, hit_count, ba_outcome))
+df <- df[-which(df$hit_count == "4 - 2"),] # remove the 4-2 count, not sure why it's there
+df <- na.omit(df)
+
+df2 <- select(temp, c(launch_angle, launch_speed, hit_distance_sc,
+                      hit_location, hc_x, hc_y, stand, hit_count, spray_angle, slg_outcome))
+df2 <- df2[-which(df2$hit_count == "4 - 2"),] # remove the 4-2 count, not sure why it's there
+df2 <- na.omit(df2)
+
+rm(temp) # remove temp from global environment
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Get Data for Different Singles
+
+y <- as_tibble(sc_18)
+y <- y %>%
+      filter(events == "single") %>%
+      arrange(launch_speed)
+y <- rbind(y[2,], y[2000,], y[6000,],y[12000,], y[18000,], y[24000,], y[26112,])
+y <- y[,c(3,6,18,19,23,53,54,79)]
+y %>%
+  kbl(caption = "Singles from the 2018 Season") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed")) %>%
+  row_spec(c(1,7), bold = T)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Combine MLBID with Statcast Data
+
+eda_2018 <- merge(MLBID, sc_18, by.x = "MLBID", by.y = "pitcher")
+eda_2018 <- as.tibble(eda_2018) # make tibble for dplyr
+
+rm(sc_18) # remove sc_18 from global environment
+
+TopStrikeZone <- 3.5
+BotStrikeZone <- 1.5
+LeftStrikeZone <- -0.85
+RightStrikeZone <- 0.85
+StrikeZone <- data.frame(
+  x=c(LeftStrikeZone, LeftStrikeZone, RightStrikeZone, RightStrikeZone, LeftStrikeZone),
+  y=c(BotStrikeZone, TopStrikeZone, TopStrikeZone, BotStrikeZone, BotStrikeZone))
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig1 <- ggplot(data = eda_2018 %>% 
+         filter(type == "X")) +
+         geom_bar(mapping = aes(x = hit_location), color = "black", fill = "darkgreen") + 
+         labs(title = "1: First Fielder", x = "Position")
+fig2 <- ggplot(data = eda_2018 %>%
+         filter(fielding_team == "HOU" | fielding_team == "OAK" |
+                fielding_team == "LAA" | fielding_team == "SEA" | fielding_team == "TEX",
+                if_fielding_alignment != "null")) +
+         geom_bar(mapping = aes(x = fielding_team, fill = if_fielding_alignment), color = "black") +
+         labs(title = "2: Infield Shifts (AL West)", x = "AL West Team", fill = "Shift Type")
+ggarrange(fig1, fig2, nrow = 1, ncol = 2)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig3 <- ggplot(data = eda_2018 %>%
+         filter(PLAYERNAME == "Clayton Kershaw", pitch_type != "null", stand == "L")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = pitch_type)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1,col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         labs(title = "3: Clayton Kershaw Pitching to Left-Handers",
+              x = "Horitzonal Position of Ball", y = "Vertical position of Ball", color = "Pitch Type")
+fig3
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig4 <- ggplot(data = eda_2018 %>%
+         filter(PLAYERNAME == "Clayton Kershaw", pitch_type != "null")) +
+         geom_density(mapping = aes(x = release_speed, color = pitch_type)) +
+         labs(title = "4: Clayton Kershaw Pitch Velocity",
+              x = "Pitch Velocity (mph)", color = "Pitch Type")
+fig4
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig5 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Mookie Betts",
+                description == "swinging_strike" | description == "called_strike")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("magenta","blue")) +
+         labs(title = "5: Mookie Betts Strikes (670 Pitches)",
+              x = "Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig5
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig6 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Justin Upton",
+                description == "swinging_strike" | description == "called_strike")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("magenta","blue")) +
+         labs(title = "6: Justin Upton Strikes (725 Pitches)",
+              x = "Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig6
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig7 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Mookie Betts", pitch_type == "SL",
+                description == "swinging_strike" | description == "ball")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("orange","blue")) +
+         labs(title = "7: Mookie Betts vs. Sliders",
+              x = "Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig7
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig8 <- ggplot(data = eda_2018 %>%
+         filter(player_name == "Justin Upton", pitch_type == "SL",
+                description == "swinging_strike" | description == "ball")) +
+         geom_point(mapping = aes(x = plate_x, y = plate_z, color = description)) +
+         geom_path(aes(x,y), data = StrikeZone, lwd = 1, col = "black") +
+         xlim(-5, 5) + ylim(-0.5, 5) +
+         scale_color_manual(values = c("orange","blue")) +
+         labs(title = "Justin Upton vs. Sliders",
+              x = "8: Horitzonal Position of Ball",
+              y = "Vertical position of Ball", color = "Description")
+fig8
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig9 <- ggplot() +
+         geom_density(data = eda_2018 %>%
+         filter(pitch_type == "FF"),
+         mapping = aes(x = release_spin_rate), color = "blue") +
+         geom_density(data = eda_2018 %>%
+         filter(PLAYERNAME == "Gerrit Cole", pitch_type == "FF"),
+         mapping = aes(x = release_spin_rate), color = "red") +
+         labs(title = "9: Gerrit Cole Fastball Spin Rate",
+              x = "Spin Rate of Fastball ", color = "Pitch Type")
+fig10 <- ggplot(data = eda_2018 %>%
+         filter(pitch_type == "FF",
+                fielding_team == "HOU" | fielding_team == "OAK" |
+                fielding_team == "LAA" | fielding_team == "SEA" | fielding_team == "TEX")) +
+         geom_boxplot(mapping = aes(x = fielding_team, y = release_spin_rate), color = "red") +
+         labs(title = "10: AL West Fastball Spin Rate",
+              x = "AL West Team", y = "Spin Rate (rpm)", color = "Pitch Type")
+fig11 <- ggplot(data = eda_2018 %>%
+         filter(pitch_type == "FF")) +
+         geom_point(mapping = aes(x = release_speed, y = release_spin_rate), color = "green") +
+         geom_abline() +
+         labs(title = "11: Fastball Spin vs. Velocity",
+              x = "Velocity (mph)", y = "Spin Rate (rpm)", color = "Pitch Type")
+fig12 <- ggplot(data = eda_2018 %>%
+         filter(pitch_type == "CH")) +
+         geom_point(mapping = aes(x = release_speed, y = release_spin_rate), color = "blue") +
+         geom_abline() + 
+         labs(title = "12: Change-up Spin vs. Velocity",
+              x = "Velocity (mph)", y = "Spin Rate (rpm)", color = "Pitch Type")
+
+rm(eda_2018) # remove eda_2018 from global environment
+ggarrange(fig9, fig10, fig11, fig12, nrow = 2, ncol = 2)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+M <- cor(df[,1:6])
+corrplot(M, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig13 <- ggplot(data = df, mapping = aes(x = launch_angle, y = launch_speed, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "13: Launch Angle vs. Exit Velo",
+               x = "Launch Angle (deg)", y = "Launch Speed (mph)")
+fig14 <- ggplot(data = df, mapping = aes(x = spray_angle, y = launch_speed, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "14: Spray Angle vs. Exit Velo",
+               x = "Spray Angle (deg)", y = "Launch Speed (mph)")
+fig15 <- ggplot(data = df, mapping = aes(x = launch_angle, y = spray_angle, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "15: Launch Angle vs. Spray Angle",
+               x = "Launch Angle (deg)", y = "Spray Angle (deg)")
+fig16 <- ggplot(data = df, mapping = aes(x = hc_x, y = hc_y, color = ba_outcome)) +
+          geom_point() +
+          scale_color_manual(values = c("green","darkred")) +
+          theme(legend.position = "none") +
+          labs(title = "16: Hit X vs. Hit Y",
+               x = "Hit coordinate X of Batted Ball", y = "Hit coordinate Y of Batted Ball")
+ggarrange(fig13, fig14, fig15, fig16, nrow = 2, ncol = 2)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig17 <- ggplot(data = df) +
+          geom_bar(mapping = aes(x = stand, fill = ba_outcome), color = "black") +
+          scale_fill_manual(values = c("green","darkred")) +
+          labs(title = "17: Hits by Handendness", x = "Stand", fill = "Outcome")
+fig18 <- ggplot(data = df) +
+          geom_bar(mapping = aes(x = hit_count, fill = ba_outcome), color = "black") + 
+          scale_fill_manual(values = c("green","darkred")) +
+          labs(title = "18: Hits by Hitter's Count", x = "Hitter's Count", fill = "Outcome")
+ggarrange(fig17, fig18, nrow = 2, ncol = 1)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+regfit.full <- regsubsets(ba_outcome~., data = df, nvmax = 9)
+reg.summary <- summary(regfit.full)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+par(mfrow = c(2,2))
+plot(reg.summary$cp, xlab = "Number of Variables", ylab = "CP", type = "l")
+plot(reg.summary$bic, xlab = "Number of Variables", ylab = "BIC", type = "l")
+plot(reg.summary$rss, xlab = "Number of Variables", ylab = "RSS", type = "l")
+plot(reg.summary$adjr2, xlab = "Number of Variables", ylab = "Adjusted RSq", type = "l")
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+coef(regfit.full, 5)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+set.seed(1)
+X <- df[,c(1:3,5,6)] # predictors
+
+# We sample 5000 random rows because data is too large and receiving RAM errors
+X <- X[sample(nrow(X), size = 5000),]
+X <- scale(X) # scale variables
+k2 <- kmeans(X, centers = 2, nstart = 25)
+k3 <- kmeans(X, centers = 3, nstart = 25)
+k4 <- kmeans(X, centers = 4, nstart = 25)
+k5 <- kmeans(X, centers = 5, nstart = 25)
+
+fviz_nbclust(X, kmeans, method = "wss") # elbow method
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Comparing clusters
+p1 <- fviz_cluster(k2, geom = "point", data = X) + ggtitle("k = 2")
+p2 <- fviz_cluster(k3, geom = "point", data = X) + ggtitle("k = 3")
+p3 <- fviz_cluster(k4, geom = "point", data = X) + ggtitle("k = 4")
+p4 <- fviz_cluster(k5, geom = "point", data = X) + ggtitle("k = 5")
+
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+Cluster <- c(1,2)
+Launch_Angle <- c(0.6896526, -0.7489219)
+Launch_Speed <- c(0.2724195, -0.2958314)
+Hit_Distance <- c(0.8441786, -0.9167279)
+Hit_Y <- c(-0.7495764, 0.8139955)
+Spray_Angle <- c(0.01589557, -0.01726164)
+table2 <- as.tibble(data.frame(Cluster, Launch_Angle, Launch_Speed, Hit_Distance, Hit_Y, Spray_Angle))
+
+table2 %>%
+  kbl(caption = "Summary of Cluster Means (Scaled)") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# X <- df[,c(1:6)]
+X <- df[,c(1:3,5,6)] # predictors
+res.pca <- prcomp(X, scale = TRUE)
+pca1 <- fviz_eig(res.pca)
+pca2 <- fviz_pca_biplot(res.pca, invisible = "ind")
+
+grid.arrange(pca1, pca2, ncol = 2)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+df <- df[,c(1:3,5,6,10)] # select predictors with response
+df <- df %>%
+  mutate_if(is.numeric, scale) # scale variables for modeling
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# K-fold Cross Validation Set-UP
+
+  n <- nrow(df)
+  k <- 5 # 5-fold cross validation
+  df <- df[sample(x = n, size = n, replace = FALSE), ]
+  ba.accuracy <- rep(0,6) # initialize accuracy vector
+  ba.standard.error <- rep(0,6) # initialize standard error vector
+
+  # create our "k.folds" matrix that splits data into train and test
+  set.seed(533)
+  sample.rows <- sample(1:n)
+  cols <- floor(n/k)
+  k.folds <- matrix(sample.rows[1:(cols*k)], nrow = k)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 1: Logistic Regression
+
+glm.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df[test.index,]
+  train <- df[train.index,]
+    
+  # fit the logistic regression model
+  
+  glm.model <- glm(ba_outcome~., data = train, family = binomial)
+  glm.pred <- predict(glm.model, test, type = "response")
+  glm.confusion.matrix <- table(actual = test$ba_outcome, predicted = glm.pred > 0.5)
+  glm.accuracy[i] <- (glm.confusion.matrix[1,1] + glm.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[1] <- sum(glm.accuracy) / k
+  ba.standard.error[1] <- sd(glm.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Tuning for our models: Random Forest and Decision Trees
+
+set.seed(533)  # for reproducibility
+
+  # Tuning for Random Forest
+
+  train.tune <- sample(x = nrow(df), size = 1000)
+  # Try using 1000 random observations from the data set for tuning purposes.
+
+  tune.rf <- tune.randomForest(x = df[train.tune, 1:5], y = df[train.tune, 6],
+                               formula = ba_outcome~., data = df,
+                               mtry = seq(from = 2, to = 6, by = 1),
+                               ntree = seq(from = 10, to = 100, by = 5))
+  # the format of the arguments is important; see help documentation
+  best.mtry <- tune.rf$best.parameters[1,1]
+  best.ntree <- tune.rf$best.parameters[1,2]
+  
+  # Tuning for Decision Trees
+  
+  tune.dtree <- tune.rpart(formula = ba_outcome~., data = df[train.tune,],
+                           minsplit = seq(from = 10, to = 100, by = 5),
+                           cp = seq(from = 0.01, to = 0.2, by = 0.01))
+  best.minsplit <- tune.dtree$best.parameters[1,1]
+  best.cp <- tune.dtree$best.parameters[1,2]
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 2: Decision Trees
+
+tree.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df[test.index,]
+  train <- df[train.index,]
+    
+  # fit the decision tree model
+  
+  tree.model <- rpart(formula = ba_outcome~., data = train,
+                     control = rpart.control(minsplit = best.minsplit, cp = best.cp))
+  tree.pred <- predict(tree.model, test, type = "class")
+  tree.confusion.matrix <- table(tree.pred, test$ba_outcome)
+  tree.accuracy[i] <- (tree.confusion.matrix[1,1] + tree.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[2] <- sum(tree.accuracy) / k
+  ba.standard.error[2] <- sd(tree.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 3: Random Forests
+
+rf.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df[test.index,]
+  train <- df[train.index,]
+    
+  # fit the random forests model
+  
+  ba.rf.model <- randomForest(ba_outcome~., data = train, ntree = best.ntree, mtry = best.mtry)
+  rf.pred <- predict(ba.rf.model, test)
+  rf.confusion.matrix <- table(rf.pred, test$ba_outcome)
+  rf.accuracy[i] <- (rf.confusion.matrix[1,1] + rf.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[3] <- sum(rf.accuracy) / k
+  ba.standard.error[3] <- sd(rf.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 4: Adaptive Boosting
+
+boosting.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df[test.index,]
+  train <- df[train.index,]
+
+  # fit the boosting model
+  
+  boosting.model <- boosting(formula = ba_outcome~., data = train, boos = TRUE, mfinal = 10)
+  boosting.pred <- predict.boosting(object = boosting.model, newdata = test)
+  boosting.confusion.matrix <- boosting.pred$confusion
+  boosting.accuracy[i] <- (boosting.confusion.matrix[1,1] + boosting.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[4] <- sum(boosting.accuracy) / k
+  ba.standard.error[4] <- sd(boosting.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 5: Naive Bayes
+
+nb.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df[test.index,]
+  train <- df[train.index,]
+
+  # fit the naive Bayes model
+  
+  nb.model <- naiveBayes(formula = ba_outcome~., data = train)
+  nb.pred <- predict(nb.model, test, type = "class")
+  nb.confusion.matrix <- table(nb.pred, test$ba_outcome)
+  nb.accuracy[i] <- (nb.confusion.matrix[1,1] + nb.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[5] <- sum(nb.accuracy) / k
+  ba.standard.error[5] <- sd(nb.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 6: Neural Network
+
+nn.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df[test.index,]
+  train <- df[train.index,]
+
+  # fit the neural networks model
+  
+  nn.model <- nnet(ba_outcome~., data = train, size = 3)
+  nn.pred <- predict(nn.model, test, type = "class")
+  nn.confusion.matrix <- table(nn.pred, test$ba_outcome)
+  nn.accuracy[i] <- (nn.confusion.matrix[1,1] + nn.confusion.matrix[2,2]) / nrow(test)
+}
+  ba.accuracy[6] <- sum(nn.accuracy) / k
+  ba.standard.error[6] <- sd(nn.accuracy) / sqrt(k)
+  # list(ba.accuracy = ba.accuracy, ba.standard.error = ba.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+Model <- c("Logit","Trees","R_Forest","Boosting","Naive_Bayes","NNets")
+Accuracy <- c(72.67, 87.05, 92.45, 90.37, 71.36, 88.89)
+Standard_Error <- c(0.0020, 0.0007, 0.0007, 0.0011, 0.0017, 0.0034)
+table3 <- as.tibble(data.frame(Model, Accuracy, Standard_Error))
+
+table3 %>%
+  kbl(caption = "Summary of Model Results for Hit vs. Not Hit") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+names(ba.accuracy) <- c("Logit","Trees","R_Forest","Boosting","Naive_Bayes","NNets")
+names(ba.standard.error) <- c("Logit","Trees","R_Forest","Boosting","Naive_Bayes","NNets")
+ba.df <- as.data.frame(cbind(ba.accuracy,ba.standard.error))
+
+ggplot(data = ba.df, mapping = aes(x = rownames(ba.df), y = ba.accuracy, color = rownames(ba.df))) +
+  geom_point() +
+  geom_errorbar(data = ba.df, mapping = aes(ymin = ba.accuracy-ba.standard.error, ymax = ba.accuracy+ba.standard.error),
+                width = 0.2, position = position_dodge(0.05)) +
+  labs(title = "Cross-Validation Accuracy Rate for Each Model",
+       x = "Model", y = "Accuracy Rate", color = "Model")
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig19 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = launch_angle, y = launch_speed, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "19: Launch Angle vs. Exit Velo",
+               x = "Launch Angle (deg)", y = "Launch Speed (mph)", color = "Outcome")
+fig20 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = spray_angle, y = launch_speed, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "20: Spray Angle vs. Exit Velo",
+               x = "Spray Angle (deg)", y = "Launch Speed (mph)", color = "Outcome")
+ggarrange(fig19, fig20, nrow = 2, ncol = 1)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig21 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = launch_angle, y = spray_angle, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "21: Launch Angle vs. Spray Angle",
+               x = "Launch Angle (deg)", y = "Spray Angle (deg)", color = "Outcome")
+fig22 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single"),
+                mapping = aes(x = hc_x, y = hc_y, color = slg_outcome)) +
+          geom_point() +
+          labs(title = "22: Hit X vs. Hit Y",
+               x = "Hit coordinate X of Batted Ball", y = "Hit coordinate Y of Batted Ball",
+               color = "Outcome")
+ggarrange(fig21, fig22, nrow = 2, ncol = 1)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+fig23 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single")) +
+          geom_bar(mapping = aes(x = stand, fill = slg_outcome), color = "black") +
+          labs(title = "23: Extra-Base Hits by Handendness",
+               x = "Stand", fill = "Outcome")
+fig24 <- ggplot(data = df2 %>%
+                filter(slg_outcome != "not_hit" & slg_outcome != "single")) +
+          geom_bar(mapping = aes(x = hit_count, fill = slg_outcome), color = "black") + 
+          labs(title = "24: Extra-Base Hits by Hitter's Count",
+               x = "Hitter's Count", fill = "Outcome")
+ggarrange(fig23, fig24, nrow = 2, ncol = 1)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+df2 <- df2[,c(1:3,6,9,10)] # select predictors with response, based on subset selection
+df2 <- df2 %>%
+  mutate_if(is.numeric, scale) # scale variables for modeling
+
+slg.accuracy <- rep(0,4) # initialize accuracy vector
+slg.standard.error <- rep(0,4) # initialize standard error vector
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Tuning for Random Forests and Decision Trees
+
+set.seed(323)  # for reproducibility
+
+  # Tuning for Random Forest
+
+  train.tune <- sample(x = nrow(df2), size = 1000)
+  # Try using 1000 random observations from the data set for tuning purposes.
+
+  tune.rf <- tune.randomForest(x = df2[train.tune, 1:5], y = df2[train.tune, 6],
+                               formula = outcome~., data = df2,
+                               mtry = seq(from = 2, to = 6, by = 1),
+                               ntree = seq(from = 10, to = 100, by = 5))
+  # the format of the arguments is important; see help documentation
+  best.mtry2 <- tune.rf$best.parameters[1,1]
+  best.ntree2 <- tune.rf$best.parameters[1,2]
+  
+  # Tuning for Decision Trees
+  
+  tune.dtree <- tune.rpart(formula = slg_outcome~., data = df2[train.tune,],
+                           minsplit = seq(from = 60, to = 100, by = 5),
+                           cp = seq(from = 0.01, to = 0.2, by = 0.01))
+  best.minsplit <- tune.dtree$best.parameters[1,1]
+  best.cp <- tune.dtree$best.parameters[1,2]
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 1: Decision Trees
+
+multi.tree.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+    
+  # fit the decision tree model
+  
+  tree.model <- rpart(formula = slg_outcome~., data = train,
+                     control = rpart.control(minsplit = best.minsplit, cp = best.cp))
+  tree.pred <- predict(tree.model, test, type = "class")
+  tree.confusion.matrix <- confusionMatrix(tree.pred, test$slg_outcome)
+  multi.tree.accuracy[i] <- tree.confusion.matrix$overall['Accuracy']
+}
+  slg.accuracy[1] <- sum(multi.tree.accuracy) / k
+  slg.standard.error[1] <- sd(multi.tree.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 2: Random Forests
+
+multi.rf.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+    
+  # fit the random forests model
+  
+  slg.rf.model <- randomForest(slg_outcome~., data = train, ntree = best.ntree2, mtry = best.mtry2)
+  rf.pred <- predict(slg.rf.model, test)
+  rf.confusion.matrix <- confusionMatrix(rf.pred, test$slg_outcome)
+  multi.rf.accuracy[i] <- rf.confusion.matrix$overall['Accuracy']
+}
+  slg.accuracy[2] <- sum(multi.rf.accuracy) / k
+  slg.standard.error[2] <- sd(multi.rf.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 3: Boosting
+
+multi.boosting.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+
+  # fit the boosting model
+  
+  boosting.model <- boosting(formula = slg_outcome~., data = train, boos = TRUE, mfinal = 10)
+  boosting.pred <- predict.boosting(object = boosting.model, newdata = test)
+  multi.boosting.accuracy[i] <- 1 - boosting.pred$error
+}
+  slg.accuracy[3] <- sum(multi.boosting.accuracy) / k
+  slg.standard.error[3] <- sd(multi.boosting.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Model 4: Neural Network
+
+multi.nn.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+
+  test <- df2[test.index,]
+  train <- df2[train.index,]
+
+  # fit the neural network model
+  
+  nn.model <- nnet(slg_outcome~., data = train, size = 3)
+  nn.pred <- predict(nn.model, test, type = "class")
+  nn.confusion.matrix <- table(nn.pred, test$slg_outcome)
+  multi.nn.accuracy[i] <- (nn.confusion.matrix[1,2] + nn.confusion.matrix[2,3] +
+                           nn.confusion.matrix[3,1] + nn.confusion.matrix[4,4] ) / nrow(test)
+}
+  slg.accuracy[4] <- sum(multi.nn.accuracy) / k
+  slg.standard.error[4] <- sd(multi.nn.accuracy) / sqrt(k)
+  # list(slg.accuracy = slg.accuracy, slg.standard.error = slg.standard.error)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+Model <- c("Trees","R_Forest","Boosting","NNets")
+Accuracy <- c(84.42, 89.61, 85.77, 84.37)
+Standard_Error <- c(0.0009, 0.0004, 0.0038, 0.0031)
+table4 <- as.tibble(data.frame(Model, Accuracy, Standard_Error))
+
+table4 %>%
+  kbl(caption = "Summary of Model Results for Multi-Classification Hits") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+names(slg.accuracy) <- c("Trees","R_Forest","Boosting","NNets")
+names(slg.standard.error) <- c("Trees","R_Forest","Boosting","NNets")
+df <- as.data.frame(cbind(slg.accuracy,slg.standard.error))
+
+ggplot(data = df, mapping = aes(x = rownames(df), y = slg.accuracy, color = rownames(df))) +
+  geom_point() +
+  geom_errorbar(data = df, mapping = aes(ymin = slg.accuracy-slg.standard.error, ymax = slg.accuracy+slg.standard.error),
+                width = 0.2, position = position_dodge(0.05)) +
+  labs(title = "Cross-Validation Accuracy Rate for Each Model",
+       x = "Model", y = "Accuracy Rate", color = "Model")
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Read in 2019 Statcast Data and Prepare Test Data for Modeling and Analysis
+
+sc_19 <- read.csv(file = "statcast_19.csv", header = TRUE)
+
+# Turn categorical variables into factors
+
+sc_19 <- sc_19 %>%
+        mutate_if(is.character, as.factor)
+
+# Identify pitches in play
+temp <- sc_19 %>%
+          filter(type == "X")
+
+# Create new variables "spray_angle" "ba_outcome" and "slg_outcome"
+temp <- mutate(temp, spray_angle = temp$hc_x)
+temp <- mutate(temp, ba_outcome = temp$events)
+temp <- mutate(temp, slg_outcome = temp$events)
+
+# Calculate "spray_angle", formula found in references
+temp$spray_angle <- atan((temp$hc_x-125.42)/(198.27-temp$hc_y))
+
+# Binary "ba_outcome" variable, hit or out
+temp$ba_outcome <- if_else(temp$ba_outcome == "single"|
+                           temp$ba_outcome == "double"|
+                           temp$ba_outcome == "triple"|
+                           temp$ba_outcome == "home_run",
+                           "hit","not_hit")
+
+# Identify "slg_outcome", singles, doubles, triples, and home runs
+temp$slg_outcome <- recode_factor(temp$slg_outcome,
+                             "batter_interference" = "not_hit",
+                              "caught_stealing_2b" = "not_hit",
+                              "caught_stealing_3b" = "not_hit",
+                              "caught_stealing_home" = "not_hit",
+                              "double_play" = "not_hit",
+                              "field_error" = "not_hit",
+                              "field_out" = "not_hit",
+                              "fielders_choice" = "not_hit",
+                              "fielders_choice_out" = "not_hit",
+                              "force_out" = "not_hit",
+                              "grounded_into_double_play" = "not_hit",
+                              "hit_by_pitch" = "not_hit",
+                              "interf_def" = "not_hit",
+                              "null" = "not_hit",
+                              "other_out" = "not_hit",
+                              "pickoff_1b" = "not_hit",
+                              "pickoff_2b" = "not_hit",
+                              "pickoff_3b" = "not_hit",
+                              "pickoff_caught_stealing_2b" = "not_hit",
+                              "pickoff_caught_stealing_3b" = "not_hit",
+                              "pickoff_caught_stealing_home" = "not_hit",
+                              "run" = "not_hit",
+                              "sac_bunt" = "not_hit",
+                              "sac_bunt_double_play" = "not_hit",
+                              "sac_fly" = "not_hit",
+                              "sac_fly_double_play" = "not_hit",
+                              "strikeout" = "not_hit",
+                              "strikeout_double_play" = "not_hit",
+                              "triple_play" = "not_hit",
+                              "walk" = "not_hit")
+
+# Change Outcome to factor variable
+temp <- temp %>% 
+  mutate_if(is.character, as.factor)
+
+# Analyzing player
+p1.train <- filter(temp, player_name != "Eduardo Escobar")
+p1.train <- select(p1.train, c(launch_angle, launch_speed, hit_distance_sc, 
+                      hc_y, spray_angle, ba_outcome, slg_outcome))
+p1.test <- filter(temp, player_name == "Eduardo Escobar")
+p1.test <- select(p1.test, c(launch_angle, launch_speed, hit_distance_sc, 
+                      hc_y, spray_angle, ba_outcome, slg_outcome))
+p1.train <- na.omit(p1.train); p1.test <- na.omit(p1.test)
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# Eduardo Escobar 2019 results
+
+set.seed(26)
+
+p1.ba.rf.model <- randomForest(ba_outcome ~.-slg_outcome,
+                                  data = p1.train, ntree = best.ntree, mtry = best.mtry)
+p1.ba.rf.pred <- predict(p1.ba.rf.model, p1.test)
+p1.ba.rf.cm <- table(p1.ba.rf.pred, p1.test$ba_outcome)
+p1.ba.rf.accuracy <- (p1.ba.rf.cm[1,1] + p1.ba.rf.cm[2,2]) / nrow(p1.test)
+p1.ba.rf.cm
+
+p1.slg.rf.model <- randomForest(slg_outcome~.-ba_outcome,
+                                   data = p1.train, ntree = best.ntree2, mtry = best.mtry2)
+p1.slg.rf.pred <- predict(p1.slg.rf.model, p1.test)
+p1.slg.rf.cm <- confusionMatrix(p1.slg.rf.pred, p1.test$slg_outcome)
+p1.slg.rf.accuracy <- p1.slg.rf.cm$overall['Accuracy']
+p1.slg.rf.cm$table
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+Player <- "Eduardo Escobar"
+Actual_Hits <- 165
+Predicted_Hits <- 150
+Actual_BA <- 0.3474
+Predicted_BA <- 0.3158
+Actual_SLG <- 0.6589
+Predicted_SLG <- 0.6273
+table5 <- as.tibble(data.frame(Player, Actual_Hits, Predicted_Hits,
+                               Actual_BA, Predicted_BA,
+                               Actual_SLG, Predicted_SLG))
+table5 %>%
+  kbl(caption = "Eduardo Escobar: 2019 Actual vs. Predicted") %>%
+  kable_classic(html_font = "Cambria") %>%
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
