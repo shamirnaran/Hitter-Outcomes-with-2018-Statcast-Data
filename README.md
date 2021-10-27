@@ -1,1 +1,5 @@
-# Hitter-Outcomes-with-2018-Statcast-Data
+It is well-known that data analysis in baseball front offices has skyrocketed over the last decade making it essential for the avid fan to keep up. This report aims to introduce some of the variables teams are researching and what questions we seek to answer with such data. Specifically, it investigates how predicting hitter outcomes through statistical methodology can be useful when evaluating players.
+
+Six classification methods were trained and tested to predict whether a pitch hit into play resulted in a hit or non-hit. The six methods were logistic regression, decision trees, random forests, adaptive boosting, naive Bayes, and neural networks. To go one step further, four of the six classification methods were compared to predict whether a pitch hit into play resulted in a single, double, triple, home run, or non-hit.
+
+Of the methods, random forests provides the best results with a respectable ninety percent accuracy rate. We conclude that variables such as launch angle, launch speed, and hit distance can help accurately predict hitter outcomes. Using statcast data with statistical concepts only encourages further baseball analysis. To name a few, one can dive deeper into topics such as pitch sequence, expected swing-and-miss, and catcher framing.
